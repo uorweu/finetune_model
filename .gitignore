@@ -1,0 +1,58 @@
+### --- Python & Environment --- ###
+__pycache__/
+*.py[cod]
+*$py.class
+venv/
+env/
+.env
+.venv/
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+### --- AI Models & Heavy Data (QUAN TRỌNG) --- ###
+# Không nên push file model và dữ liệu âm thanh lên Git vì dung lượng rất lớn
+*.h5
+*.pb
+*.tar.gz
+*.wav
+*.mp3
+yamnet_saved_model/
+variables/
+assets/
+
+# Folder chứa 1,000 file dataset của sếp (giả sử tên là data hoặc dataset)
+data/
+datasets/
+extracted_data/
+
+### --- Logs & Training Checkpoints --- ###
+logs/
+checkpoints/
+*.ckpt
+*.ckpt.index
+*.ckpt.data-00000-of-00001
+
+### --- IDEs & OS Files --- ###
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini
+
+### --- Scripts cá nhân --- ###
+# Nếu sếp muốn giữ bí mật các cấu hình chạy máy cá nhân
+run_train.sh
+run_train.bat
