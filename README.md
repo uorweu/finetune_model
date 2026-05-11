@@ -1,2 +1,3 @@
-# fine_tune_yamnet
-### 5/11/2026
+### Requirements
+- python3
+

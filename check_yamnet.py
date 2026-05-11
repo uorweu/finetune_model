@@ -1,3 +1,15 @@
+import os
+import warnings
+
+# 1. Tắt các log của TensorFlow (0: Tất cả, 1: Ẩn INFO, 2: Ẩn INFO & WARNING, 3: Ẩn tất cả kể cả ERROR)
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
+
+# 2. Tắt cảnh báo về oneDNN (Dòng chữ vàng đầu tiên trong hình của bạn)
+os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'
+
+# 3. Tắt các cảnh báo từ thư viện Python (như DeprecationWarning)
+warnings.filterwarnings('ignore')
+
 import tensorflow as tf
 import tensorflow_hub as hub
 import numpy as np
