@@ -24,7 +24,6 @@ wheels/
 
 ### --- AI Models & Heavy Data (QUAN TRỌNG) --- ###
 # Không nên push file model và dữ liệu âm thanh lên Git vì dung lượng rất lớn
-*.h5
 *.pb
 *.tar.gz
 *.wav
