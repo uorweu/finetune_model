@@ -120,4 +120,4 @@ if __name__ == "__main__":
     
     
     print(f"\n✅ Xong! Model đã được lưu tại: {MODEL_NAME}")
-    print(f"Nhớ dùng file này để nhận diện thực tế nhé ông!")
+    print(f"Dùng file này để nhận diện thực tế")

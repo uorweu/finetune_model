@@ -1,18 +1,21 @@
 import os
+import logging
 import warnings
 
-# 1. Tắt các log của TensorFlow (0: Tất cả, 1: Ẩn INFO, 2: Ẩn INFO & WARNING, 3: Ẩn tất cả kể cả ERROR)
-os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
-
-# 2. Tắt cảnh báo về oneDNN (Dòng chữ vàng đầu tiên trong hình của bạn)
+# 1. Silences the C++ level (hardware/optimization logs)
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3' 
 os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'
 
-# 3. Tắt các cảnh báo từ thư viện Python (như DeprecationWarning)
+# 2. Silences Python's standard warning system (the Deprecation one you're seeing)
 warnings.filterwarnings('ignore')
 
-import tensorflow as tf
-import tensorflow_hub as hub
+# 3. Silences TensorFlow's internal logger
+logging.getLogger('tensorflow').setLevel(logging.ERROR)
+
 import numpy as np
+import pandas as pd
+import tensorflow_hub as hub
+
 
 def load_yamnet_from_hub():
     print("")
