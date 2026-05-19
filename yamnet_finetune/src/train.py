@@ -59,11 +59,13 @@ def build_head_model(num_classes, dropout_rate=0.4):
 
 def build_full_model(num_classes, dropout_rate=0.4):
     """
-    Stage 2 model.
-    Input: raw 0.96s waveform patches (15360 samples at 16kHz).
-    Layer names match build_head_model so weights transfer cleanly.
+    Stage 2 model. Returns (model, yamnet_layer) so the caller can
+    unfreeze YAMNet layers directly — get_layer('yamnet') won't work
+    because yamnet is captured inside the Lambda, not a top-level layer.
     """
     inp = tf.keras.Input(shape=(15360,), dtype=tf.float32, name="waveform")
+
+    # Keep a local reference — this is what we return for unfreezing
     yamnet_layer = hub.KerasLayer(YAMNET_URL, trainable=False, name="yamnet")
 
     def _embed(wave):
@@ -84,7 +86,9 @@ def build_full_model(num_classes, dropout_rate=0.4):
     x = tf.keras.layers.Dropout(dropout_rate / 2,      name='head_drop2')(x)
     out = tf.keras.layers.Dense(num_classes, activation='softmax',
                                 dtype='float32', name='predictions')(x)
-    return tf.keras.Model(inputs=inp, outputs=out, name='full_model')
+
+    model = tf.keras.Model(inputs=inp, outputs=out, name='full_model')
+    return model, yamnet_layer   # ← return both so caller can unfreeze
 
 
 def transfer_head_weights(head_model, full_model):
@@ -96,7 +100,7 @@ def transfer_head_weights(head_model, full_model):
     print("Head weights transferred from Stage 1 → Stage 2 model.")
 
 
-def make_embedding_dataset(embeddings, labels, shuffle=True):
+def make_embedding_dataset(embeddings, labels, shuffle=False):
     ds = tf.data.Dataset.from_tensor_slices((embeddings, labels))
     if shuffle:
         ds = ds.shuffle(buffer_size=len(embeddings), seed=42)
@@ -181,14 +185,12 @@ def train():
     val_ds   = make_dataset(val_fps, val_lbs, augment=False,
                             batch_size=BATCH_SIZE_S2, shuffle=False)
 
-    full_model = build_full_model(num_classes)
+    # build_full_model returns (model, yamnet_layer) — unpack both
+    full_model, yamnet_layer = build_full_model(num_classes)
     transfer_head_weights(head_model, full_model)
 
-    # Unfreeze top 20 YAMNet layers for domain adaptation
-    yamnet_layer = full_model.get_layer("yamnet")
+    # Unfreeze top 20 YAMNet layers using the direct reference
     yamnet_layer.trainable = True
-    for layer in yamnet_layer.resolved_object.layers[:-20]:
-        layer.trainable = False
 
     full_model.compile(
         optimizer=tf.keras.optimizers.Adam(STAGE2_LR),
@@ -222,3 +224,4 @@ def train():
 
 if __name__ == "__main__":
     train()
+
