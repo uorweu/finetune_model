@@ -1,88 +1,150 @@
 import os
 os.environ["TF_USE_LEGACY_KERAS"] = "1"
+
 import numpy as np
 import tensorflow as tf
 import tensorflow_hub as hub
 from sklearn.model_selection import train_test_split
 from sklearn.utils.class_weight import compute_class_weight
-from augment import mixup_batch
 from dataset import build_file_list, make_dataset
 
-# ── Config — updated per research docs ────────────────────────────────────────
-PROCESSED_DIR   = "data/processed"
-CHECKPOINT_DIR  = "checkpoints"
-BATCH_SIZE      = 128    # ← updated: paper used 128
-STAGE1_LR       = 3e-4   # ← updated: paper used 0.0003 (NOT 1e-3)
-STAGE2_LR       = 5e-5   # keep as-is
-STAGE1_EPOCHS   = 15     # paper hit 95% in 15 epochs; use EarlyStopping as safety
-STAGE2_EPOCHS   = 15
-MIXUP_ALPHA     = 0.1    # ← new: optimal per sweep report
-# ──────────────────────────────────────────────────────────────────────────────
+# ── Config ────────────────────────────────────────────────────────────────────
+PROCESSED_DIR  = "data/processed"
+EMBEDDINGS_DIR = "data/embeddings"
+CHECKPOINT_DIR = "checkpoints"
 
-YAMNET_URL = "https://tfhub.dev/google/yamnet/1"
+BATCH_SIZE_S1 = 512     # embeddings are tiny — large batches are fine
+BATCH_SIZE_S2 = 64      # full waveforms through YAMNet — be conservative
 
-def build_model(num_classes, dropout_rate=0.4):
-    waveform_input = tf.keras.Input(shape=(15360,), dtype=tf.float32, name="waveform")
+STAGE1_LR     = 3e-4
+STAGE2_LR     = 5e-5
+STAGE1_EPOCHS = 30      # fast epochs so the head has room to fully converge
+STAGE2_EPOCHS = 15
+
+YAMNET_URL    = "https://tfhub.dev/google/yamnet/1"
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def setup_gpu():
+    """Enable GPU memory growth + mixed precision if a GPU is available."""
+    gpus = tf.config.list_physical_devices('GPU')
+    if gpus:
+        for gpu in gpus:
+            tf.config.experimental.set_memory_growth(gpu, True)
+        tf.keras.mixed_precision.set_global_policy('mixed_float16')
+        print(f"GPU detected ({len(gpus)} device(s)) — mixed_float16 enabled.")
+        return True
+    print("No GPU detected — running on CPU.")
+    return False
+
+
+def build_head_model(num_classes, dropout_rate=0.4):
+    """
+    Stage 1 model.
+    Input: 1024-d pre-extracted YAMNet embeddings.
+    No YAMNet call needed during Stage 1 training.
+    """
+    inp = tf.keras.Input(shape=(1024,), dtype=tf.float32, name="embedding")
+    x = tf.keras.layers.Dense(512, activation='relu',  name='head_dense1')(inp)
+    x = tf.keras.layers.BatchNormalization(name='head_bn1')(x)
+    x = tf.keras.layers.Dropout(dropout_rate,          name='head_drop1')(x)
+    x = tf.keras.layers.Dense(256, activation='relu',  name='head_dense2')(x)
+    x = tf.keras.layers.BatchNormalization(name='head_bn2')(x)
+    x = tf.keras.layers.Dropout(dropout_rate / 2,      name='head_drop2')(x)
+    # dtype='float32' keeps softmax in full precision even under mixed precision
+    out = tf.keras.layers.Dense(num_classes, activation='softmax',
+                                dtype='float32', name='predictions')(x)
+    return tf.keras.Model(inputs=inp, outputs=out, name='head_model')
+
+
+def build_full_model(num_classes, dropout_rate=0.4):
+    """
+    Stage 2 model.
+    Input: raw 0.96s waveform patches (15360 samples at 16kHz).
+    Layer names match build_head_model so weights transfer cleanly.
+    """
+    inp = tf.keras.Input(shape=(15360,), dtype=tf.float32, name="waveform")
     yamnet_layer = hub.KerasLayer(YAMNET_URL, trainable=False, name="yamnet")
 
-    # YAMNet processes ONE 1-D waveform at a time, not batches.
-    # Apply it per-example with tf.map_fn, then pool frames into a single vector.
-    def _yamnet_embed(wave_1d):
-        _, emb, _ = yamnet_layer(wave_1d)        # emb: (num_frames, 1024)
-        return tf.reduce_mean(emb, axis=0)        # (1024,)
+    def _embed(wave):
+        _, emb, _ = yamnet_layer(wave)
+        return tf.reduce_mean(emb, axis=0)   # (1024,)
 
     embeddings = tf.keras.layers.Lambda(
-        lambda batch: tf.map_fn(
-            _yamnet_embed, batch, fn_output_signature=tf.float32
-        ),
+        lambda batch: tf.map_fn(_embed, batch, fn_output_signature=tf.float32),
         output_shape=(1024,),
         name="yamnet_pool",
-    )(waveform_input)
+    )(inp)
 
-    # Classification head (same as before)
-    x = tf.keras.layers.Dense(512, activation='relu')(embeddings)
-    x = tf.keras.layers.BatchNormalization()(x)
-    x = tf.keras.layers.Dropout(dropout_rate)(x)
-    x = tf.keras.layers.Dense(256, activation='relu')(x)
-    x = tf.keras.layers.BatchNormalization()(x)
-    x = tf.keras.layers.Dropout(dropout_rate / 2)(x)
-    outputs = tf.keras.layers.Dense(num_classes, activation='softmax',
-                                    name="predictions")(x)
-    return tf.keras.Model(inputs=waveform_input, outputs=outputs)
+    x = tf.keras.layers.Dense(512, activation='relu',  name='head_dense1')(embeddings)
+    x = tf.keras.layers.BatchNormalization(name='head_bn1')(x)
+    x = tf.keras.layers.Dropout(dropout_rate,          name='head_drop1')(x)
+    x = tf.keras.layers.Dense(256, activation='relu',  name='head_dense2')(x)
+    x = tf.keras.layers.BatchNormalization(name='head_bn2')(x)
+    x = tf.keras.layers.Dropout(dropout_rate / 2,      name='head_drop2')(x)
+    out = tf.keras.layers.Dense(num_classes, activation='softmax',
+                                dtype='float32', name='predictions')(x)
+    return tf.keras.Model(inputs=inp, outputs=out, name='full_model')
+
+
+def transfer_head_weights(head_model, full_model):
+    """Copy trained head weights from Stage 1 into the Stage 2 full model."""
+    for name in ['head_dense1', 'head_bn1', 'head_dense2', 'head_bn2', 'predictions']:
+        full_model.get_layer(name).set_weights(
+            head_model.get_layer(name).get_weights()
+        )
+    print("Head weights transferred from Stage 1 → Stage 2 model.")
+
+
+def make_embedding_dataset(embeddings, labels, shuffle=True):
+    ds = tf.data.Dataset.from_tensor_slices((embeddings, labels))
+    if shuffle:
+        ds = ds.shuffle(buffer_size=len(embeddings), seed=42)
+    return ds.batch(BATCH_SIZE_S1).prefetch(tf.data.AUTOTUNE)
+
 
 def train():
     os.makedirs(CHECKPOINT_DIR, exist_ok=True)
+    setup_gpu()
 
-    filepaths, labels, class_names = build_file_list(PROCESSED_DIR)
+    # ── Verify embeddings exist ───────────────────────────────────────────────
+    emb_path = os.path.join(EMBEDDINGS_DIR, "embeddings.npy")
+    if not os.path.exists(emb_path):
+        raise SystemExit(
+            f"'{emb_path}' not found.\n"
+            "Run  python extract_embeddings.py  first."
+        )
+
+    class_names = np.load(
+        os.path.join(EMBEDDINGS_DIR, "class_names.npy"), allow_pickle=True
+    ).tolist()
     num_classes = len(class_names)
     print(f"Classes ({num_classes}): {class_names}")
 
-    # ── IMPORTANT: Add a 'background' pseudo-class if not already present ──────
-    # The YAMNet paper explicitly adds background noise as a class.
-    # In your study area context: add recordings of empty room / ambient HVAC.
-    # ──────────────────────────────────────────────────────────────────────────
+    embeddings = np.load(os.path.join(EMBEDDINGS_DIR, "embeddings.npy"))
+    emb_labels = np.load(os.path.join(EMBEDDINGS_DIR, "labels.npy"))
+    print(f"Embeddings loaded: {embeddings.shape}")
 
-    train_fps, val_fps, train_lbs, val_lbs = train_test_split(
-        filepaths, labels, test_size=0.2,   # paper used 80/20
-        stratify=labels, random_state=42
+    train_emb, val_emb, train_lbl, val_lbl = train_test_split(
+        embeddings, emb_labels,
+        test_size=0.2, stratify=emb_labels, random_state=42
     )
 
-    train_ds = make_dataset(train_fps, train_lbs, augment=True,
-                            batch_size=BATCH_SIZE)
-    val_ds   = make_dataset(val_fps, val_lbs, augment=False,
-                            batch_size=BATCH_SIZE, shuffle=False)
+    train_emb_ds = make_embedding_dataset(train_emb, train_lbl, shuffle=True)
+    val_emb_ds   = make_embedding_dataset(val_emb,   val_lbl,   shuffle=False)
 
-    weights_array = compute_class_weight('balanced',
-                                         classes=np.arange(num_classes),
-                                         y=train_lbs)
+    weights_array = compute_class_weight(
+        'balanced', classes=np.arange(num_classes), y=train_lbl
+    )
     class_weights = dict(enumerate(weights_array))
 
-    model = build_model(num_classes)
-    model.summary()
+    # ── STAGE 1: Train classification head on saved embeddings ────────────────
+    print("\n=== STAGE 1: Train classification head (embedding mode) ===")
+    head_model = build_head_model(num_classes)
+    head_model.summary()
 
-    # ── STAGE 1: Train head only ───────────────────────────────────────────────
-    model.compile(
-        optimizer=tf.keras.optimizers.Adam(STAGE1_LR),  # 3e-4 per paper
+    head_model.compile(
+        optimizer=tf.keras.optimizers.Adam(STAGE1_LR),
         loss='sparse_categorical_crossentropy',
         metrics=['accuracy']
     )
@@ -93,26 +155,42 @@ def train():
             monitor='val_accuracy', save_best_only=True, verbose=1
         ),
         tf.keras.callbacks.EarlyStopping(
-            monitor='val_accuracy', patience=6, restore_best_weights=True
+            monitor='val_accuracy', patience=8, restore_best_weights=True
         ),
         tf.keras.callbacks.ReduceLROnPlateau(
-            monitor='val_loss', factor=0.5, patience=3, min_lr=1e-6, verbose=1
+            monitor='val_loss', factor=0.5, patience=4, min_lr=1e-6, verbose=1
         ),
-        tf.keras.callbacks.TensorBoard(log_dir="logs/stage1"),
     ]
 
-    print("\n=== STAGE 1: Train classification head ===")
-    model.fit(train_ds, validation_data=val_ds,
-              epochs=STAGE1_EPOCHS, callbacks=callbacks_s1,
-              class_weight=class_weights)
+    head_model.fit(
+        train_emb_ds, validation_data=val_emb_ds,
+        epochs=STAGE1_EPOCHS, callbacks=callbacks_s1,
+        class_weight=class_weights
+    )
 
-    # ── STAGE 2: Unfreeze top YAMNet layers ───────────────────────────────────
-    yamnet_layer = model.get_layer("yamnet")
+    # ── STAGE 2: Fine-tune top YAMNet layers on raw waveforms ────────────────
+    print("\n=== STAGE 2: Fine-tune top YAMNet layers (waveform mode) ===")
+
+    filepaths, labels, _ = build_file_list(PROCESSED_DIR)
+    train_fps, val_fps, train_lbs, val_lbs = train_test_split(
+        filepaths, labels, test_size=0.2, stratify=labels, random_state=42
+    )
+
+    train_ds = make_dataset(train_fps, train_lbs, augment=True,
+                            batch_size=BATCH_SIZE_S2)
+    val_ds   = make_dataset(val_fps, val_lbs, augment=False,
+                            batch_size=BATCH_SIZE_S2, shuffle=False)
+
+    full_model = build_full_model(num_classes)
+    transfer_head_weights(head_model, full_model)
+
+    # Unfreeze top 20 YAMNet layers for domain adaptation
+    yamnet_layer = full_model.get_layer("yamnet")
     yamnet_layer.trainable = True
     for layer in yamnet_layer.resolved_object.layers[:-20]:
         layer.trainable = False
 
-    model.compile(
+    full_model.compile(
         optimizer=tf.keras.optimizers.Adam(STAGE2_LR),
         loss='sparse_categorical_crossentropy',
         metrics=['accuracy']
@@ -129,17 +207,18 @@ def train():
         tf.keras.callbacks.ReduceLROnPlateau(
             monitor='val_loss', factor=0.3, patience=4, min_lr=1e-7, verbose=1
         ),
-        tf.keras.callbacks.TensorBoard(log_dir="logs/stage2"),
     ]
 
-    print("\n=== STAGE 2: Fine-tune top YAMNet layers ===")
-    model.fit(train_ds, validation_data=val_ds,
-              epochs=STAGE2_EPOCHS, callbacks=callbacks_s2,
-              class_weight=class_weights)
+    full_model.fit(
+        train_ds, validation_data=val_ds,
+        epochs=STAGE2_EPOCHS, callbacks=callbacks_s2,
+        class_weight=class_weights
+    )
 
-    model.save(os.path.join(CHECKPOINT_DIR, "yamnet_final.keras"))
-    np.save(os.path.join(CHECKPOINT_DIR, "class_names.npy"), class_names)
-    print("Done.")
+    full_model.save(os.path.join(CHECKPOINT_DIR, "yamnet_final.keras"))
+    np.save(os.path.join(CHECKPOINT_DIR, "class_names.npy"), np.array(class_names))
+    print("\nDone. Final model saved to checkpoints/yamnet_final.keras")
+
 
 if __name__ == "__main__":
     train()
