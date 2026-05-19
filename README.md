@@ -35,12 +35,12 @@ wait for data/raw being processed
 
 run
 ```powershell
-python extract_embeddings.py
+python src/extract_embeddings.py
 ```
 
 run 
 ```powershell
-python train.py
+python src/train.py
 ```
 
 for training
