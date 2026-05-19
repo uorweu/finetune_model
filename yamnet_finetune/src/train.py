@@ -1,4 +1,5 @@
 import os
+os.environ["TF_USE_LEGACY_KERAS"] = "1"
 import numpy as np
 import tensorflow as tf
 import tensorflow_hub as hub
@@ -23,9 +24,22 @@ YAMNET_URL = "https://tfhub.dev/google/yamnet/1"
 def build_model(num_classes, dropout_rate=0.4):
     waveform_input = tf.keras.Input(shape=(15360,), dtype=tf.float32, name="waveform")
     yamnet_layer = hub.KerasLayer(YAMNET_URL, trainable=False, name="yamnet")
-    _, embeddings, _ = yamnet_layer(waveform_input)  # 1024-d embeddings
 
-    # Deeper head — justified by 15-class problem vs paper's 12
+    # YAMNet processes ONE 1-D waveform at a time, not batches.
+    # Apply it per-example with tf.map_fn, then pool frames into a single vector.
+    def _yamnet_embed(wave_1d):
+        _, emb, _ = yamnet_layer(wave_1d)        # emb: (num_frames, 1024)
+        return tf.reduce_mean(emb, axis=0)        # (1024,)
+
+    embeddings = tf.keras.layers.Lambda(
+        lambda batch: tf.map_fn(
+            _yamnet_embed, batch, fn_output_signature=tf.float32
+        ),
+        output_shape=(1024,),
+        name="yamnet_pool",
+    )(waveform_input)
+
+    # Classification head (same as before)
     x = tf.keras.layers.Dense(512, activation='relu')(embeddings)
     x = tf.keras.layers.BatchNormalization()(x)
     x = tf.keras.layers.Dropout(dropout_rate)(x)
@@ -35,7 +49,6 @@ def build_model(num_classes, dropout_rate=0.4):
     outputs = tf.keras.layers.Dense(num_classes, activation='softmax',
                                     name="predictions")(x)
     return tf.keras.Model(inputs=waveform_input, outputs=outputs)
-
 
 def train():
     os.makedirs(CHECKPOINT_DIR, exist_ok=True)

@@ -1,4 +1,5 @@
 import os
+os.environ["TF_USE_LEGACY_KERAS"] = "1"
 import numpy as np
 import tensorflow as tf
 from sklearn.metrics import classification_report, confusion_matrix
@@ -42,7 +43,7 @@ def evaluate():
 
     filepaths, labels, _ = build_file_list(PROCESSED_DIR)
     _, test_fps, _, test_lbs = train_test_split(
-        filepaths, labels, test_size=0.15, stratify=labels, random_state=42
+        filepaths, labels, test_size=0.2, stratify=labels, random_state=42
     )
 
     y_true, y_pred, confidences = [], [], []
